@@ -61,7 +61,7 @@ struct AndImpl
         return a && b;
     }
 
-    static inline constexpr bool specialImplementationForNulls() { return false; }
+    static inline constexpr bool specialImplementationForNulls() { return true; }
 };
 
 struct OrImpl
@@ -138,7 +138,8 @@ template <typename Op, size_t N>
 struct AssociativeOperationImpl
 {
     /// Erases the N last columns from `in` (if there are less, then all) and puts into `result` their combination.
-    static void NO_INLINE execute(UInt8ColumnPtrs & in, UInt8Container & result)
+//    static void NO_INLINE execute(UInt8ColumnPtrs & in, UInt8Container & result)
+    static void NO_INLINE execute(ColumnRawPtrs & in, UInt8Container & result)
     {
         if (N > in.size())
         {
@@ -160,8 +161,10 @@ struct AssociativeOperationImpl
     AssociativeOperationImpl<Op, N - 1> continuation;
 
     /// Remembers the last N columns from `in`.
-    AssociativeOperationImpl(UInt8ColumnPtrs & in)
-        : vec(in[in.size() - N]->getData()), continuation(in) {}
+    AssociativeOperationImpl(ColumnRawPtrs & in)
+        : vec(in[in.size() - N]->getData()), continuation(in) {
+        in.front()->Selector
+    }
 
     /// Returns a combination of values in the i-th row of all columns stored in the constructor.
     inline UInt8 apply(size_t i) const
@@ -308,23 +311,40 @@ public:
                 + toString(arguments.size()) + ", should be at least 2.",
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
+        bool has_nullable_args = false;
         for (size_t i = 0; i < arguments.size(); ++i)
+        {
+            has_nullable_args |= arguments[i]->isNullable();
             if (!(isNativeNumber(arguments[i])
                 || (Impl::specialImplementationForNulls() && (arguments[i]->onlyNull() || isNativeNumber(removeNullable(arguments[i]))))))
                 throw Exception("Illegal type ("
                     + arguments[i]->getName()
                     + ") of " + toString(i + 1) + " argument of function " + getName(),
                     ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        }
 
-        return std::make_shared<DataTypeUInt8>();
+        /// TODO: Put this check in the above loop
+        if (has_nullable_args && !Impl::specialImplementationForNulls())
+            throw Exception(
+                    "Logical function \"" + getName() + "\" does not support Nullable arguments",
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+
+        DataTypePtr result_type(new DataTypeUInt8);
+        return has_nullable_args
+            ? makeNullable(result_type)
+            : result_type;
     }
 
     void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         size_t num_arguments = arguments.size();
         ColumnRawPtrs in(num_arguments);
+        bool has_nullable_args = false;
         for (size_t i = 0; i < num_arguments; ++i)
+        {
+            has_nullable_args |= block.getByPosition(arguments[i]).column->isColumnNullable();
             in[i] = block.getByPosition(arguments[i]).column.get();
+        }
 
         size_t rows = in[0]->size();
 
@@ -347,6 +367,9 @@ public:
 
         auto col_res = ColumnUInt8::create();
         UInt8Container & vec_res = col_res->getData();
+
+        auto null_map = ColumnUInt8::create();
+        auto & res_null_data = null_map->getData();
 
         if (has_consts)
         {
